@@ -3,9 +3,10 @@ import asyncio
 from ariadne import gql, ResolverMap
 from ariadne.executable_schema import make_executable_schema
 from graphql.pyutils import EventEmitter, EventEmitterAsyncIterator
-from starlette.routing import Mount, Router
+from starlette.applications import Starlette
+from starlette.middleware.cors import CORSMiddleware
 
-from .graphql import app_for_schema
+from .graphql import GraphQL
 from .subscription import SubscriptionAwareResolverMap
 
 
@@ -60,7 +61,21 @@ def push_message(message, info):
 
 schema = make_executable_schema(SCHEMA, [mutation, query, subscription])
 
-app = Router([
-    Mount('/graphql', app=app_for_schema(schema, debug=True))
-])
+graphql_server = GraphQL(schema)
+
+app = Starlette()
+app.add_route("/graphql/", graphql_server)
+app.add_websocket_route("/graphql/", graphql_server)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["POST"],
+    allow_headers=[
+        "accept",
+        "accept-language",
+        "content-language",
+        "content-type",
+        "x-apollo-tracing",
+    ],
+)
 app.debug = True

@@ -1,7 +1,8 @@
 import asyncio
+import functools
 import json
-from functools import partial
-from typing import Any, AsyncGenerator, cast
+import urllib.parse
+from typing import Any, AsyncGenerator, Dict, Optional, Tuple, cast
 
 from ariadne.constants import (
     CONTENT_TYPE_JSON,
@@ -13,6 +14,7 @@ from ariadne.constants import (
 from ariadne.exceptions import HttpBadRequestError, HttpError, HttpMethodNotAllowedError
 from ariadne.types import Bindable
 from graphql import (
+    DocumentNode,
     ExecutionResult,
     GraphQLError,
     GraphQLSchema,
@@ -21,10 +23,10 @@ from graphql import (
     parse,
     subscribe,
 )
-from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
-from starlette.websockets import WebSocket
+from starlette.types import Receive, Scope, Send
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 
 GQL_CONNECTION_INIT = "connection_init"  # Client -> Server
@@ -42,153 +44,181 @@ GQL_COMPLETE = "complete"  # Server -> Client
 GQL_STOP = "stop"  # Client -> Server
 
 
-async def extract_data_from_request(request: Request) -> dict:
-    if request.headers.get("Content-Type") != DATA_TYPE_JSON:
-        raise HttpBadRequestError(
-            "Posted content must be of type {}".format(DATA_TYPE_JSON)
-        )
+class GraphQL:
+    def __init__(self, schema: GraphQLSchema):
+        self.schema = schema
 
-    data = await request.json()
-    if not isinstance(data, dict):
-        raise GraphQLError("Valid request body should be a JSON object")
+    def __call__(self, scope: Scope):
+        assert scope["type"] in {"http", "websocket"}
+        if scope["type"] == "http":
+            return functools.partial(self.handle_http, scope=scope)
+        elif scope["type"] == "websocket":
+            return functools.partial(self.handle_websocket, scope=scope)
 
-    query = data.get("query")
-    variables = data.get("variables")
-    operation_name = data.get("operationName")
+    async def context_for_request(self, request: Any) -> Any:
+        return {"request": request}
 
-    return query, variables, operation_name
+    async def root_value_for_document(
+        self, query: DocumentNode, variables: Optional[dict]
+    ):
+        return None
 
+    async def handle_http(self, receive: Receive, send: Send, *, scope: Scope):
+        request = Request(scope=scope, receive=receive)
+        if request.method == "GET" and not request.query_params.get("query"):
+            response = await self.render_playground(request)
+        elif request.method in {"GET", "POST"}:
+            response = await self.graphql_http_server(request)
+        else:
+            response = Response(status_code=400)
+        await response(receive, send)
 
-async def graphql_playground(request: Request) -> HTMLResponse:
-    response = HTMLResponse(PLAYGROUND_HTML)
-    return response
+    async def handle_websocket(self, receive: Receive, send: Send, *, scope: Scope):
+        websocket = WebSocket(scope=scope, receive=receive, send=send)
+        await self.graphql_ws_server(websocket)
 
+    def extract_data_from_request_query(
+        self, query_params: dict
+    ) -> Tuple[str, Optional[dict], Optional[str]]:
+        query = cast(str, query_params.get("query"))
+        variables = query_params.get("variables")
+        try:
+            variables = cast(dict, json.loads(variables))
+        except (TypeError, ValueError):
+            variables = None
+        operation_name = cast(str, query_params.get("operationName"))
+        return query, variables, operation_name
 
-def default_context_for_request(request: Any) -> Any:
-    return {"request": request}
+    def extract_data_from_request_data(
+        self, data: dict
+    ) -> Tuple[str, Optional[dict], Optional[str]]:
+        if not isinstance(data, dict):
+            raise GraphQLError("Valid request body should be a JSON object")
 
+        query = cast(str, data.get("query"))
+        variables = cast(dict, data.get("variables"))
+        operation_name = cast(str, data.get("operationName"))
+        return query, variables, operation_name
 
-async def graphql_http_server(
-    request: Request,
-    *,
-    schema: GraphQLSchema,
-    prepare_context=default_context_for_request
-) -> Response:
-    try:
-        query, variables, operation_name = await extract_data_from_request(request)
-        result = await graphql(
-            schema,
-            query,
-            root_value=None,
-            context_value=prepare_context(request),
-            variable_values=variables,
-            operation_name=operation_name,
-        )
-    except GraphQLError as error:
-        response = {"errors": [{"message": error.message}]}
-        return JSONResponse(response)
-    except HttpError as error:
-        response = error.message or error.status
-        return Response(response, status_code=400)
-    else:
-        response = {"data": result.data}
-        if result.errors:
-            response["errors"] = [format_error(e) for e in result.errors]
-        return JSONResponse(response)
-
-
-async def extract_data_from_websocket(message: dict) -> None:
-    payload = cast(dict, message.get("payload"))
-    if not isinstance(payload, dict):
-        raise GraphQLError("Payload must be an object")
-
-    query = payload.get("query")
-    variables = payload.get("variables")
-    operation_name = payload.get("operationName")
-
-    return query, variables, operation_name
-
-
-async def observe_async_results(
-    results: AsyncGenerator, operation_id: str, websocket: WebSocket
-):
-    async for result in results:
-        payload = {}
-        if result.data:
-            payload["data"] = result.data
-        if result.errors:
-            payload["errors"] = [format_error(e) for e in result.errors]
-        await send_json(
-            websocket, {"type": GQL_DATA, "id": operation_id, "payload": payload}
-        )
-    await send_json(websocket, {"type": GQL_COMPLETE, "id": operation_id})
-
-
-async def receive_json(websocket: WebSocket):
-    message = await websocket.receive_text()
-    return json.loads(message)
-
-
-async def send_json(websocket, message):
-    message = json.dumps(message)
-    await websocket.send_text(message)
-
-
-async def graphql_ws_server(
-    websocket: WebSocket,
-    *,
-    schema: GraphQLSchema,
-    prepare_context=default_context_for_request
-):
-    subscriptions = {}
-    await websocket.accept("graphql-ws")
-    while True:
-        message = await receive_json(websocket)
-        operation_id = cast(str, message.get("id"))
-        message_type = cast(str, message.get("type"))
-
-        if message_type == GQL_CONNECTION_INIT:
-            await send_json(websocket, {"type": GQL_CONNECTION_ACK})
-        elif message_type == GQL_CONNECTION_TERMINATE:
-            break
-        elif message_type == GQL_START:
-            query, variables, operation_name = await extract_data_from_websocket(
-                message
+    async def extract_data_from_request(
+        self, request: Request
+    ) -> Tuple[str, Optional[dict], Optional[str]]:
+        if request.method == "GET":
+            return self.extract_data_from_request_query(request.query_params)
+        if request.headers.get("Content-Type") != DATA_TYPE_JSON:
+            raise HttpBadRequestError(
+                "Posted content must be of type {}".format(DATA_TYPE_JSON)
             )
-            results = await subscribe(
-                schema,
-                parse(query),
-                root_value=None,
-                context_value=prepare_context(message),
+
+        data = await request.json()
+        return self.extract_data_from_request_data(data)
+
+    async def extract_data_from_websocket(
+        self, message: dict
+    ) -> Tuple[str, Optional[dict], Optional[str]]:
+        payload = cast(dict, message.get("payload"))
+        if not isinstance(payload, dict):
+            raise GraphQLError("Payload must be an object")
+
+        query = cast(str, payload.get("query"))
+        variables = cast(dict, payload.get("variables"))
+        operation_name = cast(str, payload.get("operationName"))
+
+        return query, variables, operation_name
+
+    async def render_playground(self, request: Request) -> HTMLResponse:
+        return HTMLResponse(PLAYGROUND_HTML)
+
+    async def graphql_http_server(self, request: Request) -> Response:
+        try:
+            query, variables, operation_name = await self.extract_data_from_request(
+                request
+            )
+            document = parse(query)
+            result = await graphql(
+                self.schema,
+                query,
+                root_value=await self.root_value_for_document(document, variables),
+                context_value=await self.context_for_request(request),
                 variable_values=variables,
                 operation_name=operation_name,
             )
-            if isinstance(results, ExecutionResult):
-                payload = {"message": format_error(results.errors[0])}
-                await send_json(
-                    websocket,
-                    {"type": GQL_ERROR, "id": operation_id, "payload": payload},
-                )
-            else:
-                subscriptions[operation_id] = results
-                asyncio.ensure_future(
-                    observe_async_results(results, operation_id, websocket)
-                )
-        elif message_type == GQL_STOP:
-            if operation_id in subscriptions:
+        except GraphQLError as error:
+            response = {"errors": [{"message": error.message}]}
+            return JSONResponse(response)
+        except HttpError as error:
+            response = error.message or error.status
+            return Response(response, status_code=400)
+        else:
+            response = {"data": result.data}
+            if result.errors:
+                response["errors"] = [format_error(e) for e in result.errors]
+            return JSONResponse(response)
+
+    async def observe_async_results(
+        self, results: AsyncGenerator, operation_id: str, websocket: WebSocket
+    ) -> None:
+        async for result in results:
+            payload = {}
+            if result.data:
+                payload["data"] = result.data
+            if result.errors:
+                payload["errors"] = [format_error(e) for e in result.errors]
+            await self.send_json(
+                websocket, {"type": GQL_DATA, "id": operation_id, "payload": payload}
+            )
+        await self.send_json(websocket, {"type": GQL_COMPLETE, "id": operation_id})
+
+    async def receive_json(self, websocket: WebSocket) -> dict:
+        message = await websocket.receive_text()
+        return json.loads(message)
+
+    async def send_json(self, websocket, message) -> None:
+        message = json.dumps(message)
+        await websocket.send_text(message)
+
+    async def graphql_ws_server(self, websocket: WebSocket) -> None:
+        subscriptions: Dict[str, AsyncGenerator] = {}
+        await websocket.accept("graphql-ws")
+        try:
+            while True:
+                message = await self.receive_json(websocket)
+                operation_id = cast(str, message.get("id"))
+                message_type = cast(str, message.get("type"))
+
+                if message_type == GQL_CONNECTION_INIT:
+                    await self.send_json(websocket, {"type": GQL_CONNECTION_ACK})
+                elif message_type == GQL_CONNECTION_TERMINATE:
+                    break
+                elif message_type == GQL_START:
+                    query, variables, operation_name = await self.extract_data_from_websocket(
+                        message
+                    )
+                    document = parse(query)
+                    results = await subscribe(
+                        self.schema,
+                        document,
+                        root_value=await self.root_value_for_document(document, variables),
+                        context_value=await self.context_for_request(message),
+                        variable_values=variables,
+                        operation_name=operation_name,
+                    )
+                    if isinstance(results, ExecutionResult):
+                        payload = {"message": format_error(results.errors[0])}
+                        await self.send_json(
+                            websocket,
+                            {"type": GQL_ERROR, "id": operation_id, "payload": payload},
+                        )
+                    else:
+                        subscriptions[operation_id] = results
+                        asyncio.ensure_future(
+                            self.observe_async_results(results, operation_id, websocket)
+                        )
+                elif message_type == GQL_STOP:
+                    if operation_id in subscriptions:
+                        await subscriptions[operation_id].aclose()
+                        del subscriptions[operation_id]
+        except WebSocketDisconnect:
+            for operation_id in subscriptions:
                 await subscriptions[operation_id].aclose()
                 del subscriptions[operation_id]
-
-
-def app_for_schema(schema: GraphQLSchema, *, debug: bool = False):
-    async def graphql_http_server_for_schema(request: Request) -> Response:
-        return await graphql_http_server(request, schema=schema)
-
-    async def graphql_ws_server_for_schema(websocket: WebSocket) -> None:
-        return await graphql_ws_server(websocket, schema=schema)
-
-    app = Starlette(debug=debug)
-    app.add_route("/", graphql_playground, methods=["GET"])
-    app.add_route("/", graphql_http_server_for_schema, methods=["POST"])
-    app.add_websocket_route("/", graphql_ws_server_for_schema)
-    return app
