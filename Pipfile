@@ -9,6 +9,7 @@ uvicorn = "*"
 [packages]
 ariadne = "*"
 starlette = "*"
+gino = "*"
 
 [requires]
 python_version = "3.7"

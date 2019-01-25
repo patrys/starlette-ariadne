@@ -6,6 +6,7 @@ from graphql.pyutils import EventEmitter, EventEmitterAsyncIterator
 from starlette.applications import Starlette
 from starlette.middleware.cors import CORSMiddleware
 
+from .database import Note, db
 from .graphql import GraphQL
 from .subscription import SubscriptionAwareResolverMap
 
@@ -20,9 +21,11 @@ type Note {
 
 type Query {
     hello: String!
+    notes: [Note!]!
 }
 
 type Mutation {
+    createNote(title: String!, body: String!): Note!
     sendMessage(message: String!): Boolean!
 }
 
@@ -41,6 +44,18 @@ subscription = SubscriptionAwareResolverMap("Subscription")
 async def say_hello(root, info):
     await asyncio.sleep(3)
     return "Hello!"
+
+
+@query.field("notes")
+async def get_all_notes(root, info):
+    notes = await Note.query.gino.all()
+    return notes
+
+
+@mutation.field("createNote")
+async def create_note(root, info, title: str, body: str):
+    note = await Note.create(title=title, body=body)
+    return note
 
 
 @mutation.field("sendMessage")
@@ -63,6 +78,12 @@ schema = make_executable_schema(SCHEMA, [mutation, query, subscription])
 
 graphql_server = GraphQL(schema)
 
+
+async def init_database():
+    await db.set_bind("postgresql://localhost/gino")
+    await db.gino.create_all()
+
+
 app = Starlette()
 app.add_route("/graphql/", graphql_server)
 app.add_websocket_route("/graphql/", graphql_server)
@@ -78,4 +99,5 @@ app.add_middleware(
         "x-apollo-tracing",
     ],
 )
+app.add_event_handler("startup", init_database)
 app.debug = True
