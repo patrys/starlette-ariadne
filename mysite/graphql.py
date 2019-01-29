@@ -12,7 +12,6 @@ from ariadne.constants import (
     PLAYGROUND_HTML,
 )
 from ariadne.exceptions import HttpBadRequestError, HttpError, HttpMethodNotAllowedError
-from ariadne.types import Bindable
 from graphql import (
     DocumentNode,
     ExecutionResult,

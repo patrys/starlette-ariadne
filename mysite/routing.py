@@ -8,7 +8,6 @@ from starlette.middleware.cors import CORSMiddleware
 
 from .database import Note, db
 from .graphql import GraphQL
-from .subscription import SubscriptionAwareResolverMap
 
 
 SCHEMA = gql(
@@ -31,13 +30,14 @@ type Mutation {
 
 type Subscription {
     messages: String!
+    count(limit: Int!): Int!
 }
 """
 )
 mutation = ResolverMap("Mutation")
 pubsub = EventEmitter()
 query = ResolverMap("Query")
-subscription = SubscriptionAwareResolverMap("Subscription")
+subscription = ResolverMap("Subscription")
 
 
 @query.field("hello")
@@ -64,7 +64,7 @@ async def send_message(root, info, message):
     return True
 
 
-@subscription.subscription("messages")
+@subscription.source("messages")
 def subscribe_messages(root, info):
     return EventEmitterAsyncIterator(pubsub, "message")
 
@@ -72,6 +72,18 @@ def subscribe_messages(root, info):
 @subscription.field("messages")
 def push_message(message, info):
     return message
+
+
+@subscription.source("count")
+async def counter(root, info, limit):
+    for i in range(limit):
+        await asyncio.sleep(1)
+        yield i
+
+
+@subscription.field("count")
+def count(number, info, limit):
+    return number + 1
 
 
 schema = make_executable_schema(SCHEMA, [mutation, query, subscription])
